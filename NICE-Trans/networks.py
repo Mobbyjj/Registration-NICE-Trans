@@ -13,6 +13,35 @@ from torch.distributions.normal import Normal
 # Networks
 ########################################################
     
+class NICE_Trans_2D(nn.Module):
+    
+    def __init__(self, 
+                 in_channels: int = 1, 
+                 enc_channels: int = 8, 
+                 dec_channels: int = 16, 
+                 use_checkpoint: bool = True):
+        super().__init__()
+        
+        self.Encoder = Conv_encoder_2D(in_channels=in_channels,
+                                    channel_num=enc_channels,
+                                    use_checkpoint=use_checkpoint)
+        self.Decoder = Trans_decoder_2D(in_channels=enc_channels,
+                                     channel_num=dec_channels, 
+                                     use_checkpoint=use_checkpoint)
+        
+        self.SpatialTransformer = SpatialTransformer_block_2D(mode='bilinear')
+        self.AffineTransformer = AffineTransformer_block_2D(mode='bilinear')
+
+    def forward(self, fixed, moving):
+
+        x_fix = self.Encoder(fixed)
+        x_mov = self.Encoder(moving)
+        flow, affine_para = self.Decoder(x_fix, x_mov)
+        warped = self.SpatialTransformer(moving, flow)
+        affined = self.AffineTransformer(moving, affine_para)
+        
+        return warped, flow, affined, affine_para
+        
 class NICE_Trans(nn.Module):
     
     def __init__(self, 
@@ -46,7 +75,39 @@ class NICE_Trans(nn.Module):
 ########################################################
 # Encoder/Decoder
 ########################################################
+class Conv_encoder_2D(nn.Module):
     
+    def __init__(self, 
+                 in_channels: int,
+                 channel_num: int, 
+                 use_checkpoint: bool = False):
+        super().__init__()
+        
+        self.conv_1 = Conv_block_2D(in_channels, channel_num, use_checkpoint)
+        self.conv_2 = Conv_block_2D(channel_num, channel_num*2, use_checkpoint)
+        self.conv_3 = Conv_block_2D(channel_num*2, channel_num*4, use_checkpoint)
+        self.conv_4 = Conv_block_2D(channel_num*4, channel_num*8, use_checkpoint)
+        self.conv_5 = Conv_block_2D(channel_num*8, channel_num*16, use_checkpoint)
+        self.downsample = nn.AvgPool2d(2, stride=2)
+
+    def forward(self, x_in):
+
+        x_1 = self.conv_1(x_in)
+        
+        x = self.downsample(x_1)
+        x_2 = self.conv_2(x)
+        
+        x = self.downsample(x_2)
+        x_3 = self.conv_3(x)
+        
+        x = self.downsample(x_3)
+        x_4 = self.conv_4(x)
+        
+        x = self.downsample(x_4)
+        x_5 = self.conv_5(x)
+        
+        return [x_1, x_2, x_3, x_4, x_5]
+
 class Conv_encoder(nn.Module):
     
     def __init__(self, 
@@ -79,7 +140,115 @@ class Conv_encoder(nn.Module):
         x_5 = self.conv_5(x)
         
         return [x_1, x_2, x_3, x_4, x_5]
+
+class Trans_decoder_2D(nn.Module):
     
+    def __init__(self,
+                 in_channels: int,
+                 channel_num: int, 
+                 use_checkpoint: bool = False):
+        super().__init__()
+        
+        self.conv_1 = Conv_block_2D(in_channels*2+channel_num, channel_num, use_checkpoint)
+        self.trans_2 = SwinTrans_stage_block(embed_dim=channel_num*2,
+                                             num_layers=4,
+                                             num_heads=channel_num//8,
+                                             window_size=[5,5,5],
+                                             use_checkpoint=use_checkpoint)
+        self.trans_3 = SwinTrans_stage_block(embed_dim=channel_num*4,
+                                             num_layers=4,
+                                             num_heads=channel_num//4,
+                                             window_size=[5,5,5],
+                                             use_checkpoint=use_checkpoint)
+        self.trans_4 = SwinTrans_stage_block(embed_dim=channel_num*8,
+                                             num_layers=4,
+                                             num_heads=channel_num//2,
+                                             window_size=[5,5,5],
+                                             use_checkpoint=use_checkpoint)
+        self.trans_5 = SwinTrans_stage_block(embed_dim=channel_num*16,
+                                             num_layers=4,
+                                             num_heads=channel_num,
+                                             window_size=[5,5,5],
+                                             use_checkpoint=use_checkpoint)
+        
+        self.backdim_2 = nn.Conv3d(in_channels*4+channel_num*2, channel_num*2, kernel_size=1, stride=1, padding='same')
+        self.backdim_3 = nn.Conv3d(in_channels*8+channel_num*4, channel_num*4, kernel_size=1, stride=1, padding='same')
+        self.backdim_4 = nn.Conv3d(in_channels*16+channel_num*8, channel_num*8, kernel_size=1, stride=1, padding='same')
+        self.backdim_5 = nn.Conv3d(in_channels*32, channel_num*16, kernel_size=1, stride=1, padding='same')
+        
+        self.upsample_1 = PatchExpanding_block(embed_dim=channel_num*2)
+        self.upsample_2 = PatchExpanding_block(embed_dim=channel_num*4)
+        self.upsample_3 = PatchExpanding_block(embed_dim=channel_num*8)
+        self.upsample_4 = PatchExpanding_block(embed_dim=channel_num*16)
+        
+        self.reghead_1 = DeformHead_block(channel_num, use_checkpoint)
+        self.reghead_2 = DeformHead_block(channel_num*2, use_checkpoint)
+        self.reghead_3 = DeformHead_block(channel_num*4, use_checkpoint)
+        self.reghead_4 = DeformHead_block(channel_num*8, use_checkpoint)
+        self.reghead_5 = AffineHead_block(channel_num*16)
+        
+        self.ResizeTransformer = ResizeTransformer_block(resize_factor=2, mode='trilinear')
+        self.SpatialTransformer = SpatialTransformer_block(mode='bilinear')
+
+    def forward(self, x_fix, x_mov):
+        
+        x_fix_1, x_fix_2, x_fix_3, x_fix_4, x_fix_5 = x_fix
+        x_mov_1, x_mov_2, x_mov_3, x_mov_4, x_mov_5 = x_mov
+        
+        # Step 1
+        x = torch.cat([x_fix_5, x_mov_5], dim=1)
+        x = self.backdim_5(x)
+        x_5 = self.trans_5(x)
+        flow_5, affine_para = self.reghead_5(x_5)
+        
+        # Step 2
+        flow_5_up = self.ResizeTransformer(flow_5)
+        x_mov_4 = self.SpatialTransformer(x_mov_4, flow_5_up)
+        
+        x = self.upsample_4(x_5)
+        x = torch.cat([x_fix_4, x, x_mov_4], dim=1)
+        x = self.backdim_4(x)
+        x_4 = self.trans_4(x)
+        
+        x = self.reghead_4(x_4)
+        flow_4 = x + flow_5_up
+        
+        # Step 3
+        flow_4_up = self.ResizeTransformer(flow_4)
+        x_mov_3 = self.SpatialTransformer(x_mov_3, flow_4_up)
+        
+        x = self.upsample_3(x_4)
+        x = torch.cat([x_fix_3, x, x_mov_3], dim=1)
+        x = self.backdim_3(x)
+        x_3 = self.trans_3(x)
+        
+        x = self.reghead_3(x_3)
+        flow_3 = x + flow_4_up
+        
+        # Step 4
+        flow_3_up = self.ResizeTransformer(flow_3)
+        x_mov_2 = self.SpatialTransformer(x_mov_2, flow_3_up)
+        
+        x = self.upsample_2(x_3)
+        x = torch.cat([x_fix_2, x, x_mov_2], dim=1)
+        x = self.backdim_2(x)
+        x_2 = self.trans_2(x)
+        
+        x = self.reghead_2(x_2)
+        flow_2 = x + flow_3_up
+        
+        # Step 5
+        flow_2_up = self.ResizeTransformer(flow_2)
+        x_mov_1 = self.SpatialTransformer(x_mov_1, flow_2_up)
+        
+        x = self.upsample_1(x_2)
+        x = torch.cat([x_fix_1, x, x_mov_1], dim=1)
+        x_1 = self.conv_1(x)
+        
+        x = self.reghead_1(x_1)
+        flow_1 = x + flow_2_up
+        
+        return flow_1, affine_para    
 
 class Trans_decoder(nn.Module):
     
@@ -259,6 +428,43 @@ class ResizeTransformer_block(nn.Module):
 
         return x
 
+class Conv_block_2D(nn.Module):
+
+    def __init__(self, 
+                 in_channels: int, 
+                 out_channels:int , 
+                 use_checkpoint: bool = False):
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        
+        self.Conv_1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding='same')
+        self.norm_1 = nn.InstanceNorm2d(out_channels)
+        
+        self.Conv_2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding='same')
+        self.norm_2 = nn.InstanceNorm2d(out_channels)
+        
+        self.LeakyReLU = nn.LeakyReLU(0.2)
+        
+    def Conv_forward(self, x_in):
+
+        x = self.Conv_1(x_in)
+        x = self.LeakyReLU(x)
+        x = self.norm_1(x)
+        
+        x = self.Conv_2(x)
+        x = self.LeakyReLU(x)
+        x_out = self.norm_2(x)
+        
+        return x_out
+    
+    def forward(self, x_in):
+        
+        if self.use_checkpoint and x_in.requires_grad:
+            x_out = checkpoint.checkpoint(self.Conv_forward, x_in)
+        else:
+            x_out = self.Conv_forward(x_in)
+        
+        return x_out
 
 class Conv_block(nn.Module):
 
@@ -379,7 +585,53 @@ class PatchExpanding_block(nn.Module):
         x_out = einops.rearrange(x, 'b d h w c -> b c d h w')
         
         return x_out
-    
+
+class SwinTrans_stage_block_2D(nn.Module):
+
+    def __init__(self,
+                 embed_dim: int,
+                 num_layers: int,
+                 num_heads: int,
+                 window_size: list,
+                 mlp_ratio: float = 4.0,
+                 qkv_bias: bool = True,
+                 drop: float = 0.0,
+                 attn_drop: float = 0.0,
+                 use_checkpoint: bool = False):
+        super().__init__()
+        
+        self.window_size = window_size
+        self.shift_size = tuple(i // 2 for i in window_size)
+        self.no_shift = tuple(0 for i in window_size)
+        
+        self.blocks = nn.ModuleList()
+        for i in range(num_layers):
+            block = SwinTrans_Block(embed_dim=embed_dim,
+                                    num_heads=num_heads,
+                                    window_size=self.window_size,
+                                    shift_size=self.no_shift if (i % 2 == 0) else self.shift_size,
+                                    mlp_ratio=mlp_ratio,
+                                    qkv_bias=qkv_bias,
+                                    drop=drop,
+                                    attn_drop=attn_drop,
+                                    use_checkpoint=use_checkpoint)
+            self.blocks.append(block)
+        
+    def forward(self, x_in):
+        
+        b, c, d, h, w = x_in.shape
+        window_size, shift_size = get_window_size((d, h, w), self.window_size, self.shift_size)
+        dp = int(np.ceil(d / window_size[0])) * window_size[0]
+        hp = int(np.ceil(h / window_size[1])) * window_size[1]
+        wp = int(np.ceil(w / window_size[2])) * window_size[2]
+        attn_mask = compute_mask([dp, hp, wp], window_size, shift_size, x_in.device)
+        
+        x = einops.rearrange(x_in, 'b c d h w -> b d h w c')
+        for block in self.blocks:
+            x = block(x, mask_matrix=attn_mask)
+        x_out = einops.rearrange(x, 'b d h w c -> b c d h w')
+
+        return x_out    
 
 class SwinTrans_stage_block(nn.Module):
 
@@ -427,7 +679,95 @@ class SwinTrans_stage_block(nn.Module):
         x_out = einops.rearrange(x, 'b d h w c -> b c d h w')
 
         return x_out
-    
+
+class SwinTrans_Block_2D(nn.Module):
+
+    def __init__(self,
+                 embed_dim: int,
+                 num_heads: int,
+                 window_size: list,
+                 shift_size: list,
+                 mlp_ratio: float = 4.0,
+                 qkv_bias: bool = True,
+                 drop: float = 0.0,
+                 attn_drop: float = 0.0,
+                 use_checkpoint: bool = False):
+        super().__init__()
+                         
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.use_checkpoint = use_checkpoint
+                         
+        self.norm1 = nn.LayerNorm(embed_dim)  
+        self.attn = MSA_block_2D(embed_dim,
+                              window_size=window_size,
+                              num_heads=num_heads,
+                              qkv_bias=qkv_bias,
+                              attn_drop=attn_drop,
+                              proj_drop=drop)
+
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = MLP_block_2D(hidden_size=embed_dim, 
+                                mlp_dim=int(embed_dim * mlp_ratio), 
+                                dropout_rate=drop)
+
+    def forward_part1(self, x_in, mask_matrix):
+        
+        x = self.norm1(x_in)
+        # attention: channel is in the final dim.
+        b, d, h, w, c = x.shape
+        window_size, shift_size = get_window_size((d, h, w), self.window_size, self.shift_size)
+        pad_l = pad_t = pad_d0 = 0
+        pad_d1 = (window_size[0] - d % window_size[0]) % window_size[0]
+        pad_b = (window_size[1] - h % window_size[1]) % window_size[1]
+        pad_r = (window_size[2] - w % window_size[2]) % window_size[2]
+        x = nnf.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b, pad_d0, pad_d1))
+        _, dp, hp, wp, _ = x.shape
+        dims = [b, dp, hp, wp]
+        
+        if any(i > 0 for i in shift_size):
+            shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(1, 2, 3))
+            attn_mask = mask_matrix
+        else:
+            shifted_x = x
+            attn_mask = None  
+         
+        x_windows = window_partition(shifted_x, window_size)
+        attn_windows = self.attn(x_windows, mask=attn_mask)
+        
+        attn_windows = attn_windows.view(-1, *(window_size + (c,)))
+        shifted_x = window_reverse(attn_windows, window_size, dims)
+        
+        if any(i > 0 for i in shift_size):
+            x_out = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1], shift_size[2]), dims=(1, 2, 3))
+        else:
+            x_out = shifted_x
+
+        if pad_d1 > 0 or pad_r > 0 or pad_b > 0:
+            x_out = x_out[:, :d, :h, :w, :].contiguous()
+
+        return x_out
+
+    def forward_part2(self, x_in):
+        
+        x = self.norm2(x_in)
+        x_out = self.mlp(x)
+        return x_out
+
+    def forward(self, x_in, mask_matrix=None):
+        
+        if self.use_checkpoint and x_in.requires_grad:
+            x = x_in + checkpoint.checkpoint(self.forward_part1, x_in, mask_matrix)
+        else:
+            x = x_in + self.forward_part1(x_in, mask_matrix)
+                         
+        if self.use_checkpoint and x.requires_grad:
+            x_out = x + checkpoint.checkpoint(self.forward_part2, x)
+        else:
+            x_out = x + self.forward_part2(x)
+        
+        return x_out
+
 
 class SwinTrans_Block(nn.Module):
 
@@ -518,6 +858,75 @@ class SwinTrans_Block(nn.Module):
         return x_out
 
 
+class MSA_block_2D(nn.Module):
+
+    def __init__(self,
+                 embed_dim: int,
+                 num_heads: int,
+                 window_size: list,
+                 qkv_bias: bool = False,
+                 attn_drop: float = 0.0,
+                 proj_drop: float = 0.0):
+        super().__init__()
+        
+        self.embed_dim = embed_dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = embed_dim // num_heads
+        self.scale = head_dim**-0.5
+        mesh_args = torch.meshgrid.__kwdefaults__
+
+        self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * self.window_size[0] - 1) * 
+                                                                     (2 * self.window_size[1] - 1), num_heads))
+        coords_d = torch.arange(self.window_size[0])
+        coords_h = torch.arange(self.window_size[1])
+        if mesh_args is not None:
+            coords = torch.stack(torch.meshgrid(coords_d, coords_h, indexing="ij"))
+        else:
+            coords = torch.stack(torch.meshgrid(coords_d, coords_h))
+        coords_flatten = torch.flatten(coords, 1)
+        # TODO: need check
+        relative_coords = coords_flatten[:,  None] - coords_flatten[ None, :]
+        relative_coords = relative_coords.permute(1, 0).contiguous()
+        relative_coords[:, 0] += self.window_size[0] - 1
+        relative_coords[:, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+        
+        self.qkv = nn.Linear(embed_dim, embed_dim * 2, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        trunc_normal_(self.relative_position_bias_table, std=0.02)
+        self.Softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x_in):
+        
+        b, n = x_in.shape
+        # TODO: need check
+        qkv = self.qkv(x_in).reshape(b, 2, self.num_heads, n // self.num_heads).permute(1, 0, 2, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+        
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.clone()[:n, :n].reshape(-1)
+        ].reshape(n, n, -1)
+        relative_position_bias = relative_position_bias.permute(1, 0).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        attn = self.Softmax(attn)
+        attn = self.attn_drop(attn).to(v.dtype)
+        
+        x = (attn @ v).transpose(1, 2).reshape(b, n)
+        x = self.proj(x)
+        x_out = self.proj_drop(x)
+        
+        return x_out
+
 class MSA_block(nn.Module):
 
     def __init__(self,
@@ -592,6 +1001,33 @@ class MSA_block(nn.Module):
         
         return x_out
     
+class MLP_block_2D(nn.Module):
+
+    def __init__(self, hidden_size: int, mlp_dim: int, dropout_rate: float = 0.0):
+        super().__init__()
+
+        if not (0 <= dropout_rate <= 1):
+            raise ValueError("dropout_rate should be between 0 and 1.")
+        
+        self.linear1 = nn.Linear(hidden_size, mlp_dim)
+        self.linear2 = nn.Linear(mlp_dim, hidden_size)
+        
+        self.drop1 = nn.Dropout(dropout_rate)
+        self.drop2 = nn.Dropout(dropout_rate)
+        
+        self.GELU = nn.GELU()
+
+    def forward(self, x_in):
+        
+        x = self.linear1(x_in)
+        x = self.GELU(x)
+        x = self.drop1(x)
+        
+        x = self.linear2(x)
+        x_out = self.drop2(x)
+        
+        return x_out
+
     
 class MLP_block(nn.Module):
 
